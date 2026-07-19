@@ -220,7 +220,32 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
             },
           });
         } catch (err) {
-          return json({ ok: false, error: String(err) });
+          return new Response(JSON.stringify({ ok: false, error: String(err) }), {
+            headers: {
+              "Content-Type": "application/json; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+      }
+
+      if (url.pathname.startsWith("/api/usage/") && url.pathname.endsWith("/compact") && req.method === "POST") {
+        const sessionId = url.pathname.slice("/api/usage/".length, -"/compact".length);
+        try {
+          const result = await compactSessionById(sessionId);
+          return json({ ok: result.success, message: result.message });
+        } catch (err) {
+          return json({ ok: false, error: String(err) }, 400);
+        }
+      }
+
+      if (url.pathname.startsWith("/api/usage/") && url.pathname.endsWith("/reset") && req.method === "DELETE") {
+        const sessionId = url.pathname.slice("/api/usage/".length, -"/reset".length);
+        try {
+          await resetSessionById(sessionId);
+          return json({ ok: true });
+        } catch (err) {
+          return json({ ok: false, error: String(err) }, 400);
         }
       }
 
