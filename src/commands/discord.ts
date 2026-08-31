@@ -1063,7 +1063,22 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
         }
       }
     } else if (message.referenced_message) {
-      const ref = message.referenced_message;
+      let ref = message.referenced_message;
+      // Gateway-delivered referenced_message is "best effort" — Discord doesn't guarantee
+      // content is populated (seen empty for messages the bot itself just posted). Refetch
+      // via REST when that happens so the model always gets the real quoted text.
+      if (!ref.content) {
+        try {
+          const fetched = await discordApi<DiscordMessage>(
+            config.token,
+            "GET",
+            `/channels/${ref.channel_id}/messages/${ref.id}`,
+          );
+          if (fetched) ref = fetched;
+        } catch (err) {
+          debugLog(`Failed to refetch referenced message content: ${err instanceof Error ? err.message : err}`);
+        }
+      }
       const refAuthor = ref.author.username;
       const refImages = ref.attachments.filter(isImageAttachment);
       const refOther = ref.attachments.filter((a) => !isImageAttachment(a));
