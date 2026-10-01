@@ -88,6 +88,7 @@ const DEFAULT_SETTINGS: Settings = {
   timeouts: { telegram: 5, discord: 10, discordRetry: 10, heartbeat: 15, job: 30, default: 5 },
   watchdog: { maxConsecutiveTimeouts: null, maxRuntimeSeconds: null },
   session: { autoRotate: false, maxMessages: 50, maxAgeHours: 24, summaryPath: "" },
+  compaction: { nightly: { enabled: false, hour: 3, minTokens: 200_000 } },
   plugins: {},
 };
 
@@ -191,7 +192,21 @@ export interface Settings {
   watchdog: WatchdogSettings;
   plugins: Record<string, PluginEntry>;
   session: SessionConfig;
+  compaction: CompactionConfig;
   jobsDir?: string;
+}
+
+export interface CompactionConfig {
+  /** Nightly pass that compacts large thread sessions while nobody is chatting. */
+  nightly: {
+    enabled: boolean;
+    /** Local hour (0-23, in the configured timezone) to run. Default: 3. */
+    hour: number;
+    /** Compact sessions whose context is at least this many tokens. Default: 200000. */
+    minTokens: number;
+    /** Discord channel for a summary when any compaction fails. Silent when unset. */
+    notifyChannel?: string;
+  };
 }
 
 
@@ -432,8 +447,24 @@ function parseSettings(
       maxAgeHours: Number.isFinite(raw.session?.maxAgeHours) ? Number(raw.session.maxAgeHours) : 24,
       summaryPath: typeof raw.session?.summaryPath === "string" ? raw.session.summaryPath.trim() : "",
     },
+    compaction: parseCompaction(raw.compaction),
     apiToken: typeof raw.apiToken === "string" && raw.apiToken.trim() ? raw.apiToken.trim() : undefined,
     ...(typeof raw.jobsDir === "string" && raw.jobsDir.trim() ? { jobsDir: raw.jobsDir.trim() } : {}),
+  };
+}
+
+function parseCompaction(raw: any): CompactionConfig {
+  const n = raw?.nightly ?? {};
+  const hour = Number(n.hour);
+  const minTokens = Number(n.minTokens);
+  const notifyChannel = typeof n.notifyChannel === "string" && n.notifyChannel.trim() ? n.notifyChannel.trim() : undefined;
+  return {
+    nightly: {
+      enabled: n.enabled === true,
+      hour: Number.isInteger(hour) && hour >= 0 && hour <= 23 ? hour : 3,
+      minTokens: Number.isFinite(minTokens) && minTokens > 0 ? minTokens : 200_000,
+      ...(notifyChannel ? { notifyChannel } : {}),
+    },
   };
 }
 

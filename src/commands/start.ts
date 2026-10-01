@@ -6,6 +6,7 @@ import { run, runUserMessage, streamUserMessage, bootstrap, ensureProjectClaudeM
 import { writeState, type StateData } from "../statusline";
 import { cronMatches, nextCronMatch } from "../cron";
 import { clearJobSchedule, deleteRetryJob, isRetryJobName, loadJobs, snapshotJobFrontmatter } from "../jobs";
+import { runNightlyCompaction } from "../nightly-compaction";
 import { writePidFile, cleanupPidFile, checkExistingDaemon } from "../pid";
 import { initConfig, loadSettings, reloadSettings, resolvePrompt, type HeartbeatConfig, type Settings } from "../config";
 import { getDayAndMinuteAtOffset, buildClockPromptPrefix } from "../timezone";
@@ -961,8 +962,31 @@ export async function start(args: string[] = []) {
       );
   }
 
+  // --- Nightly compaction of large thread sessions ---
+  let nightlyCompactionRunning = false;
+  function maybeRunNightlyCompaction(now: Date) {
+    const cfg = currentSettings.compaction.nightly;
+    if (!cfg.enabled || nightlyCompactionRunning || isRateLimited()) return;
+    if (!cronMatches(`0 ${cfg.hour} * * *`, now, currentSettings.timezoneOffsetMinutes)) return;
+    nightlyCompactionRunning = true;
+    console.log(`[${ts()}] Nightly compaction: checking sessions >= ${cfg.minTokens} tokens`);
+    runNightlyCompaction(cfg.minTokens)
+      .then((r) => {
+        if (r.failed.length === 0 || !cfg.notifyChannel || !discordSendToChannel) return;
+        const lines = r.failed.map((f) => `- ${f.threadId} (${Math.round(f.tokens / 1000)}k tokens): ${f.reason}`);
+        const text =
+          `Nightly compaction: ${r.compacted.length} compacted, ${r.failed.length} failed.\n` + lines.join("\n");
+        return discordSendToChannel(cfg.notifyChannel, text);
+      })
+      .catch((err) => console.error(`[${ts()}] Nightly compaction error:`, err))
+      .finally(() => {
+        nightlyCompactionRunning = false;
+      });
+  }
+
   setInterval(() => {
     const now = new Date();
+    maybeRunNightlyCompaction(now);
     if (!isRateLimited()) {
       for (const job of currentJobs) {
         // Fire pending retries before checking the cron schedule.

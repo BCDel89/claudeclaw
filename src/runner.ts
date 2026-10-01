@@ -996,7 +996,8 @@ export async function compactCurrentSession(agentName?: string): Promise<{ succe
 // because Discord threads have their own session store. agentName is used only for cwd isolation.
 export async function compactCurrentThreadSession(
   threadId: string,
-  agentName?: string
+  agentName?: string,
+  timeoutMsOverride?: number,
 ): Promise<{ success: boolean; message: string }> {
   // Share the same per-thread queue as normal message runs (see execClaude below) so a
   // compact triggered from the web dashboard can't race a Discord/Telegram turn that's
@@ -1008,7 +1009,7 @@ export async function compactCurrentThreadSession(
     const settings = getSettings();
     const securityArgs = buildSecurityArgs(settings.security);
     const baseEnv = cleanSpawnEnv();
-    const timeoutMs = settings.sessionTimeoutMs;
+    const timeoutMs = timeoutMsOverride ?? settings.sessionTimeoutMs;
 
     const compactCwd = agentName ? await ensureAgentDir(agentName) : undefined;
     const ok = await runCompact(
