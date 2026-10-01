@@ -421,18 +421,32 @@ export async function start(args: string[] = []) {
   if (!telegramToken) console.log("  Telegram: not configured");
 
   // --- Discord ---
-  let discordSendToUser: ((userId: string, text: string) => Promise<void>) | null = null;
-  let discordSendToChannel: ((channelId: string, text: string) => Promise<void>) | null = null;
+  // `attachSinceMs`, when given, uploads outbox files referenced in the text (written after that time).
+  let discordSendToUser: ((userId: string, text: string, attachSinceMs?: number) => Promise<void>) | null = null;
+  let discordSendToChannel: ((channelId: string, text: string, attachSinceMs?: number) => Promise<void>) | null = null;
   let discordToken = "";
 
   async function initDiscord(token: string) {
     if (token && token !== discordToken) {
-      const { startGateway, sendMessageToUser, sendMessage, stopGateway } = await import("./discord");
+      const {
+        startGateway,
+        sendMessageToUser,
+        sendMessage,
+        sendMessageWithOutboxAttachments,
+        sendMessageToUserWithOutboxAttachments,
+        stopGateway,
+      } = await import("./discord");
       if (discordToken) stopGateway();
       startGateway(debugFlag);
       discordStopGateway = stopGateway;
-      discordSendToUser = (userId, text) => sendMessageToUser(token, userId, text);
-      discordSendToChannel = (channelId, text) => sendMessage(token, channelId, text);
+      discordSendToUser = (userId, text, attachSinceMs) =>
+        attachSinceMs === undefined
+          ? sendMessageToUser(token, userId, text)
+          : sendMessageToUserWithOutboxAttachments(token, userId, text, attachSinceMs);
+      discordSendToChannel = (channelId, text, attachSinceMs) =>
+        attachSinceMs === undefined
+          ? sendMessage(token, channelId, text)
+          : sendMessageWithOutboxAttachments(token, channelId, text, attachSinceMs);
       discordToken = token;
       console.log(`[${ts()}] Discord: enabled`);
     } else if (!token && discordToken) {
@@ -639,14 +653,21 @@ export async function start(args: string[] = []) {
     }
   }
 
-  function forwardToDiscord(label: string, result: { exitCode: number; stdout: string; stderr: string }, notifyChannel?: string) {
+  function forwardToDiscord(
+    label: string,
+    result: { exitCode: number; stdout: string; stderr: string },
+    notifyChannel?: string,
+    startedAt?: number,
+  ) {
     const text = result.exitCode === 0
       ? `${label ? `[${label}]\n` : ""}${result.stdout || "(empty)"}`
       : `${label ? `[${label}] ` : ""}error (exit ${result.exitCode}): ${extractErrorDetail(result) || "Unknown"}`;
+    // Only successful output can carry outbox file paths; error text is never scanned.
+    const attachSinceMs = result.exitCode === 0 ? startedAt : undefined;
 
     if (notifyChannel) {
       if (!discordSendToChannel) return;
-      discordSendToChannel(notifyChannel, text).catch((err) =>
+      discordSendToChannel(notifyChannel, text, attachSinceMs).catch((err) =>
         console.error(`[Discord] Failed to forward to channel ${notifyChannel}: ${err}`)
       );
       return;
@@ -654,7 +675,7 @@ export async function start(args: string[] = []) {
 
     if (!discordSendToUser || currentSettings.discord.allowedUserIds.length === 0) return;
     for (const userId of currentSettings.discord.allowedUserIds) {
-      discordSendToUser(userId, text).catch((err) =>
+      discordSendToUser(userId, text, attachSinceMs).catch((err) =>
         console.error(`[Discord] Failed to forward to ${userId}: ${err}`)
       );
     }
@@ -874,6 +895,7 @@ export async function start(args: string[] = []) {
   updateState();
 
   function runJob(job: (typeof currentJobs)[0]) {
+    const jobStartedAt = Date.now();
     const timeoutMs = job.timeoutSeconds ? job.timeoutSeconds * 1000 : undefined;
     snapshotJobFrontmatter(job.name)
       .then((restoreFrontmatter) =>
@@ -916,7 +938,7 @@ export async function start(args: string[] = []) {
             if (job.notify === false) return;
             if (job.notify === "error" && r.exitCode === 0) return;
             forwardToTelegram(job.name, r);
-            forwardToDiscord(job.name, r, job.notifyChannel);
+            forwardToDiscord(job.name, r, job.notifyChannel, jobStartedAt);
           })
           .finally(async () => {
             if (job.recurring) return;
