@@ -1,8 +1,9 @@
-import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { closeSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { getClaudeProjectDir, findSessionJsonlPath } from "./sessionFiles";
 import { listThreadSessions } from "./sessionManager";
 import { compactCurrentThreadSession } from "./runner";
+import { shiftDateToOffset } from "./timezone";
 
 const TAIL_BYTES = 4 * 1024 * 1024;
 // Compacting a very large session can take well over the normal per-turn timeout
@@ -94,4 +95,34 @@ export async function runNightlyCompaction(minTokens: number): Promise<NightlyCo
   );
   for (const s of result.skipped) console.log(`[nightly-compaction] skipped ${s.threadId}: ${s.reason}`);
   return result;
+}
+
+/**
+ * Whether the nightly pass is due. It runs once per local day, at or after the configured
+ * hour. Using "at or after" rather than "exactly at" means a run missed because the daemon
+ * was down at that hour (reboot, crash) still happens as soon as it's back up.
+ */
+export function nightlyCompactionDue(
+  now: Date,
+  timezoneOffsetMinutes: number,
+  hour: number,
+  lastRunDate: string | null,
+): { due: boolean; today: string } {
+  const local = shiftDateToOffset(now, timezoneOffsetMinutes);
+  const today = local.toISOString().slice(0, 10);
+  return { due: local.getUTCHours() >= hour && lastRunDate !== today, today };
+}
+
+/** Reads the local date (YYYY-MM-DD) of the last completed nightly pass, if any. */
+export function readLastNightlyRun(statePath: string): string | null {
+  try {
+    const raw = JSON.parse(readFileSync(statePath, "utf8"));
+    return typeof raw.lastRunDate === "string" ? raw.lastRunDate : null;
+  } catch {
+    return null;
+  }
+}
+
+export function writeLastNightlyRun(statePath: string, date: string): void {
+  writeFileSync(statePath, JSON.stringify({ lastRunDate: date, completedAt: new Date().toISOString() }, null, 2) + "\n");
 }

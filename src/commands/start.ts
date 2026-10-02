@@ -6,7 +6,7 @@ import { run, runUserMessage, streamUserMessage, bootstrap, ensureProjectClaudeM
 import { writeState, type StateData } from "../statusline";
 import { cronMatches, nextCronMatch } from "../cron";
 import { clearJobSchedule, deleteRetryJob, isRetryJobName, loadJobs, snapshotJobFrontmatter } from "../jobs";
-import { runNightlyCompaction } from "../nightly-compaction";
+import { nightlyCompactionDue, readLastNightlyRun, runNightlyCompaction, writeLastNightlyRun } from "../nightly-compaction";
 import { writePidFile, cleanupPidFile, checkExistingDaemon } from "../pid";
 import { initConfig, loadSettings, reloadSettings, resolvePrompt, type HeartbeatConfig, type Settings } from "../config";
 import { getDayAndMinuteAtOffset, buildClockPromptPrefix } from "../timezone";
@@ -963,11 +963,14 @@ export async function start(args: string[] = []) {
   }
 
   // --- Nightly compaction of large thread sessions ---
+  const nightlyStatePath = join(HEARTBEAT_DIR, "nightly-compaction-state.json");
+  let lastNightlyRun = readLastNightlyRun(nightlyStatePath);
   let nightlyCompactionRunning = false;
   function maybeRunNightlyCompaction(now: Date) {
     const cfg = currentSettings.compaction.nightly;
     if (!cfg.enabled || nightlyCompactionRunning || isRateLimited()) return;
-    if (!cronMatches(`0 ${cfg.hour} * * *`, now, currentSettings.timezoneOffsetMinutes)) return;
+    const { due, today } = nightlyCompactionDue(now, currentSettings.timezoneOffsetMinutes, cfg.hour, lastNightlyRun);
+    if (!due) return;
     nightlyCompactionRunning = true;
     console.log(`[${ts()}] Nightly compaction: checking sessions >= ${cfg.minTokens} tokens`);
     runNightlyCompaction(cfg.minTokens)
@@ -980,6 +983,14 @@ export async function start(args: string[] = []) {
       })
       .catch((err) => console.error(`[${ts()}] Nightly compaction error:`, err))
       .finally(() => {
+        // Recorded even when some sessions failed: the pass ran, and a failing session
+        // shouldn't make it retry all day. Failures are already reported above.
+        lastNightlyRun = today;
+        try {
+          writeLastNightlyRun(nightlyStatePath, today);
+        } catch (err) {
+          console.error(`[${ts()}] Could not record nightly compaction run:`, err);
+        }
         nightlyCompactionRunning = false;
       });
   }
