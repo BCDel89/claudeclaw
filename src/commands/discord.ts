@@ -9,7 +9,7 @@ import { listThreadSessions, removeThreadSession, peekThreadSession } from "../s
 import { readFile } from "node:fs/promises";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { findSessionJsonlPath } from "../sessionFiles";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt } from "../skills";
@@ -525,9 +525,19 @@ interface ThreadIntent {
 }
 
 // Async so a slow classifier call never blocks the event loop for other channels/jobs.
-function runClassifier(input: string): Promise<string> {
+// Runs from tmpdir with no MCP/tools so it skips CLAUDE.md + MCP startup (~4s vs 5-15s
+// from the daemon cwd, where CLAUDE.md also made Haiku ignore the classifier prompt).
+function runClassifier(systemPrompt: string, input: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn("claude", ["--model", CLASSIFIER_MODEL, "--print", "--output-format", "text"], {
+    const args = [
+      "--model", CLASSIFIER_MODEL,
+      "--strict-mcp-config",
+      "--tools", "",
+      "--system-prompt", systemPrompt,
+      "--print", "--output-format", "text",
+    ];
+    const child = spawn("claude", args, {
+      cwd: tmpdir(),
       env: { ...process.env, HOME: homedir() },
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -566,8 +576,7 @@ Rules:
 - Return ONLY valid JSON or the word null. No explanation.`;
 
   try {
-    const input = `${systemPrompt}\n\n---\nUser message: ${text}`;
-    const result = (await runClassifier(input)).trim();
+    const result = (await runClassifier(systemPrompt, `User message: ${text}`)).trim();
 
     if (!result || result === "null") return null;
     // Extract JSON from response (in case there's extra text)
