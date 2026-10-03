@@ -10,6 +10,7 @@ import { readFile } from "node:fs/promises";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { findSessionJsonlPath } from "../sessionFiles";
 import { homedir } from "node:os";
+import { spawn } from "node:child_process";
 import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt } from "../skills";
 import { createSessionRetryJob, hasActiveRetryJob } from "../jobs";
@@ -515,10 +516,37 @@ function guildTriggerReason(message: DiscordMessage): string | null {
 
 // --- Attachment handling ---
 
-// --- AI-powered thread intent classifier (uses Sonnet via Claude OAuth) ---
+// --- AI-powered thread intent classifier (uses Haiku via Claude OAuth) ---
+const CLASSIFIER_MODEL = "claude-haiku-4-5-20251001";
+const CLASSIFIER_TIMEOUT_MS = 15000;
 interface ThreadIntent {
   action: "hire" | "fire";
   names: string[];
+}
+
+// Async so a slow classifier call never blocks the event loop for other channels/jobs.
+function runClassifier(input: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("claude", ["--model", CLASSIFIER_MODEL, "--print", "--output-format", "text"], {
+      env: { ...process.env, HOME: homedir() },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      reject(new Error(`classifier timed out after ${CLASSIFIER_TIMEOUT_MS}ms`));
+    }, CLASSIFIER_TIMEOUT_MS);
+    child.stdout.on("data", (d) => { stdout += d; });
+    child.stderr.on("data", (d) => { stderr += d; });
+    child.on("error", (err) => { clearTimeout(timer); reject(err); });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve(stdout);
+      else reject(new Error(`claude exited ${code}: ${stderr.trim().slice(0, 500)}`));
+    });
+    child.stdin.end(input);
+  });
 }
 
 async function classifyThreadIntent(text: string): Promise<ThreadIntent | null> {
@@ -538,17 +566,8 @@ Rules:
 - Return ONLY valid JSON or the word null. No explanation.`;
 
   try {
-    const { execSync } = await import("node:child_process");
     const input = `${systemPrompt}\n\n---\nUser message: ${text}`;
-    const result = execSync(
-      `claude --model claude-sonnet-4-20250514 --print --output-format text`,
-      {
-        input,
-        encoding: "utf-8",
-        timeout: 15000,
-        env: { ...process.env, HOME: homedir() },
-      },
-    ).trim();
+    const result = (await runClassifier(input)).trim();
 
     if (!result || result === "null") return null;
     // Extract JSON from response (in case there's extra text)
