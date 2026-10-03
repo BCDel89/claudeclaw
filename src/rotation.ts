@@ -19,9 +19,10 @@ const STRIPPED_ENV_KEYS = new Set([
 ]);
 
 function cleanEnv(): Record<string, string> {
+  const ownToken = process.env.CLAUDECLAW_OWN_OAUTH_TOKEN === "1";
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
-    if (STRIPPED_ENV_KEYS.has(key)) continue;
+    if (STRIPPED_ENV_KEYS.has(key) && !(ownToken && key === "CLAUDE_CODE_OAUTH_TOKEN")) continue;
     if (typeof value === "string") out[key] = value;
   }
   return out;

@@ -96,6 +96,10 @@ const COMPACT_TIMEOUT_ENABLED = true;
  *   fall back to the credential store on each platform — Keychain on macOS,
  *   `~/.claude/.credentials.json` on Linux/WSL2, Credential Manager on Windows
  *   — which handles refresh automatically.
+ *   Exception: when `CLAUDECLAW_OWN_OAUTH_TOKEN=1`, the token was loaded by the
+ *   daemon's own launcher (a long-lived `claude setup-token`, ~1 year) and is
+ *   passed through. On macOS this keeps auth working when the daemon runs in a
+ *   Background session that can't reach the login Keychain.
  * - `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`: tells the CLI "the host process
  *   manages provider auth — don't read local credentials." In a detached
  *   daemon there is no host to consult; the CLI errors with `Not logged in`.
@@ -110,6 +114,7 @@ function cleanSpawnEnv(): Record<string, string> {
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
   ]);
+  if (process.env.CLAUDECLAW_OWN_OAUTH_TOKEN === "1") stripped.delete("CLAUDE_CODE_OAUTH_TOKEN");
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (stripped.has(key)) continue;
