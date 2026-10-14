@@ -221,6 +221,35 @@ function discordMessageChunks(text: string): string[] {
   return chunks;
 }
 
+// --- Copy buttons for code blocks ---
+// Discord can't put a copy button inside a code block or touch the clipboard, so each bot
+// message with fenced code blocks gets "Copy" buttons. Clicking one replies (ephemeral, same
+// channel) with just that block's raw text, which is easy to long-press → Copy Text on mobile.
+
+const COPY_BUTTON_PREFIX = "copy_code_";
+const MAX_COPY_BUTTONS = 5; // one action row
+
+function extractCodeBlocks(text: string): string[] {
+  const blocks: string[] = [];
+  for (const m of text.matchAll(/```[^\n`]*\n([\s\S]*?)```/g)) {
+    const body = m[1].replace(/\n$/, "");
+    if (body.trim()) blocks.push(body);
+  }
+  return blocks;
+}
+
+function copyButtonComponents(text: string): unknown[] | undefined {
+  const count = Math.min(extractCodeBlocks(text).length, MAX_COPY_BUTTONS);
+  if (count === 0) return undefined;
+  const buttons = Array.from({ length: count }, (_, i) => ({
+    type: 2, // BUTTON
+    style: 2, // SECONDARY
+    label: count === 1 ? "Copy" : `Copy ${i + 1}`,
+    custom_id: `${COPY_BUTTON_PREFIX}${i}`,
+  }));
+  return [{ type: 1, components: buttons }];
+}
+
 async function sendMessage(
   token: string,
   channelId: string,
@@ -231,10 +260,9 @@ async function sendMessage(
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
     const body: Record<string, unknown> = { content: chunk };
-    // Attach components only to the last chunk
-    if (components && i === chunks.length - 1) {
-      body.components = components;
-    }
+    // Explicit components go on the last chunk; otherwise add copy buttons for the chunk's code blocks
+    const chunkComponents = components && i === chunks.length - 1 ? components : copyButtonComponents(chunk);
+    if (chunkComponents) body.components = chunkComponents;
     await discordApi(token, "POST", `/channels/${channelId}/messages`, body);
   }
 }
@@ -380,7 +408,8 @@ async function sendMessageWithAttachments(
   const chunks = discordMessageChunks(text || "​");
   const uploadText = chunks.pop() ?? "​";
   for (const chunk of chunks) {
-    await discordApi(token, "POST", `/channels/${channelId}/messages`, { content: chunk });
+    const components = copyButtonComponents(chunk);
+    await discordApi(token, "POST", `/channels/${channelId}/messages`, components ? { content: chunk, components } : { content: chunk });
   }
 
   await uploadAttachmentMessage(token, channelId, uploadText, attachmentPaths);
@@ -394,7 +423,8 @@ async function uploadAttachmentMessage(
   attempt = 0,
 ): Promise<void> {
   const form = new FormData();
-  form.append("payload_json", JSON.stringify({ content: text }));
+  const components = copyButtonComponents(text);
+  form.append("payload_json", JSON.stringify(components ? { content: text, components } : { content: text }));
   for (let i = 0; i < attachmentPaths.length; i++) {
     const file = Bun.file(attachmentPaths[i]);
     form.append(`files[${i}]`, file, basename(attachmentPaths[i]));
@@ -1612,6 +1642,16 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
       await respondToInteraction(interaction, {
         content: responseText,
         flags: 64, // EPHEMERAL
+      });
+      return;
+    }
+
+    if (customId.startsWith(COPY_BUTTON_PREFIX)) {
+      const index = Number(customId.slice(COPY_BUTTON_PREFIX.length));
+      const block = extractCodeBlocks(interaction.message?.content ?? "")[index];
+      await respondToInteraction(interaction, {
+        content: block ?? "Couldn't find that code block anymore.",
+        flags: 64, // EPHEMERAL — shows in this channel, only to the clicker
       });
       return;
     }
