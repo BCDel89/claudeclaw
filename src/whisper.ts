@@ -70,6 +70,14 @@ function getWhisperBinaryPath(): string {
   return join(BIN_DIR, `whisper-cli${suffix}`);
 }
 
+/**
+ * A system whisper-cli (e.g. `brew install whisper-cpp`) wins over the bundled one: the bundled
+ * macOS build was copied out of a Homebrew bottle without its libggml/libwhisper dylibs and can't load.
+ */
+function resolveWhisperBinaryPath(): string {
+  return Bun.which("whisper-cli") ?? getWhisperBinaryPath();
+}
+
 function getModelPath(): string {
   return join(MODEL_FOLDER, `ggml-${getWhisperModel()}.bin`);
 }
@@ -248,8 +256,10 @@ async function prepareWhisperAssets(printOutput: boolean): Promise<void> {
   await mkdir(WHISPER_ROOT, { recursive: true });
   await mkdir(TMP_FOLDER, { recursive: true });
 
-  const binaryPath = getWhisperBinaryPath();
-  if (!(await fileExists(binaryPath))) {
+  const systemBinary = Bun.which("whisper-cli");
+  if (systemBinary) {
+    console.log(`whisper warmup: using system binary ${systemBinary}`);
+  } else if (!(await fileExists(getWhisperBinaryPath()))) {
     await downloadAndExtractBinary();
   } else {
     console.log("whisper warmup: binary exists");
@@ -378,7 +388,7 @@ export async function transcribeAudioToText(
   const shouldCleanup = wavPath !== inputPath;
   log(`voice transcribe: using wav=${wavPath} cleanup=${shouldCleanup}`);
 
-  const binaryPath = getWhisperBinaryPath();
+  const binaryPath = resolveWhisperBinaryPath();
   const modelPath = getModelPath();
 
   const runTranscription = () => {
