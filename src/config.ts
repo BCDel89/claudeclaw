@@ -4,6 +4,7 @@ import { existsSync } from "fs";
 import { normalizeTimezoneName, resolveTimezoneOffsetMinutes } from "./timezone";
 import { parseWatchdogConfig, type WatchdogConfig } from "./watchdog";
 import { parsePlugins, type PluginEntry } from "./plugins";
+import { parseThreadAskConfig, type ThreadAskConfig } from "./thread-ask";
 
 /** Re-exported under the name used in the Settings interface. */
 export type WatchdogSettings = WatchdogConfig;
@@ -134,6 +135,7 @@ export interface DiscordConfig {
   imageOutputRoots: string[]; // Absolute path prefixes from which image uploads are permitted
   streaming?: boolean; // When true, POST a live preview while Claude is working. Default: false.
   channelAllowedUserIds?: Record<string, string[]>; // channelId -> extra user IDs allowed in that guild channel only (never DMs)
+  threadAsk?: ThreadAskConfig; // thread-to-thread [ask:] hand-offs between sibling threads
 }
 
 export interface SlackConfig {
@@ -398,6 +400,7 @@ function parseSettings(
               .map(([k, v]) => [String(k), (v as unknown[]).map(String)]),
           )
         : undefined,
+      threadAsk: parseThreadAskConfig(raw.discord?.threadAsk),
     },
     slack: {
       botToken: process.env.SLACK_BOT_TOKEN?.trim() || (typeof raw.slack?.botToken === "string" ? raw.slack.botToken.trim() : ""),
