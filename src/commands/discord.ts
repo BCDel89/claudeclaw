@@ -9,6 +9,19 @@ import {
   type AskDirective,
   type ThreadAskConfig,
 } from "../thread-ask";
+import {
+  MAX_TELLS_PER_REPLY,
+  MAX_TELL_LENGTH,
+  NoteStore,
+  TellLimiter,
+  extractTellDirectives,
+  familyMemberName,
+  formatNotesForPrompt,
+  looksLikeSecret,
+  resolveTellTargets,
+  type TellDirective,
+  type ThreadTellConfig,
+} from "../thread-tell";
 import { isAllowed, isDiscordAuthorized } from "../allowlist";
 import { extractErrorDetail } from "../messaging";
 import { loadPendingResume } from "../pending-resume";
@@ -1349,6 +1362,8 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
     const channelName = config.channelNames?.[channelId] ?? channelId;
     const channelTag = isGuild ? `[Discord Channel: ${channelName}]` : `[Discord DM]`;
     const promptParts = [channelTag, `[Discord from ${label}]`];
+    const pendingNotes = isGuild ? await readPendingNotes(channelId) : { block: "", ids: [] };
+    if (pendingNotes.block) promptParts.push(pendingNotes.block);
     if (skillContext) {
       const args = cleanContent.trim().slice(command!.length).trim();
       promptParts.push(`<command-name>${command}</command-name>`);
@@ -1557,6 +1572,9 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
       }
     })();
 
+    // Notes are delivered once the turn succeeds, or travel with the prompt into a timeout retry.
+    if (result.exitCode === 0 || result.exitCode === 124) await ackPendingNotes(channelId, pendingNotes.ids);
+
     if (result.exitCode === 124 && isGuild) {
       // Genuinely-slow task, not a compact-retry case (that's handled inside runner.ts already,
       // only for existing sessions with history). Schedule a background retry paired to this
@@ -1628,11 +1646,21 @@ async function deliverReply(
   if (askCfg?.enabled && knownThreads.has(channelId)) {
     ({ cleanedText: text, asks } = extractAskDirectives(text));
   }
+  const tellCfg = config.threadTell;
+  let tells: TellDirective[] = [];
+  if (tellCfg?.enabled && isInThreadFamily(channelId)) {
+    ({ cleanedText: text, tells } = extractTellDirectives(text));
+  }
   const { paths: attachmentPaths, cleanedText: finalText } = extractAttachmentPaths(text, config.imageOutputRoots, requestStartedAt);
   if (attachmentPaths.length > 0) {
     await sendMessageWithAttachments(token, channelId, finalText || "(empty response)", attachmentPaths);
   } else {
     await sendMessage(token, channelId, finalText || "(empty response)");
+  }
+  if (tellCfg && tells.length > 0) {
+    dispatchTells(token, channelId, tells, tellCfg).catch((err) => {
+      console.error(`[Discord][tell] dispatch failed from ${channelId}: ${err instanceof Error ? err.message : err}`);
+    });
   }
   if (askCfg && asks.length > 0) {
     const chain = opts.chain ?? { id: Math.random().toString(36).slice(2, 8), hops: 0 };
@@ -1741,7 +1769,10 @@ async function runThreadTurn(
   const typingInterval = setInterval(() => sendTyping(token, threadId), 8000);
   try {
     await sendTyping(token, threadId);
-    const result = await runUserMessage("discord", prompt, threadId, info?.agentName);
+    const notes = await readPendingNotes(threadId);
+    const fullPrompt = notes.block ? `${notes.block}\n${prompt}` : prompt;
+    const result = await runUserMessage("discord", fullPrompt, threadId, info?.agentName);
+    if (result.exitCode === 0) await ackPendingNotes(threadId, notes.ids);
     if (result.exitCode !== 0) {
       const detail = result.exitCode === 124 ? "timed out" : extractErrorDetail(result) || "Unknown error";
       await sendMessage(token, threadId, `Error (exit ${result.exitCode}): ${detail}`);
@@ -1750,6 +1781,73 @@ async function runThreadTurn(
     return await deliverReply(token, threadId, result.stdout || "", startedAt, { label, chain });
   } finally {
     clearInterval(typingInterval);
+  }
+}
+
+// --- Thread tells ([tell:] notes within a parent channel and its threads) ---
+
+const noteStore = new NoteStore(join(process.cwd(), ".claude", "claudeclaw", "thread-notes"));
+const tellLimiter = new TellLimiter();
+
+/** A channel is in a thread family if it's a known thread or the parent of one. */
+function isInThreadFamily(channelId: string): boolean {
+  if (knownThreads.has(channelId)) return true;
+  for (const info of knownThreads.values()) if (info.parentId === channelId) return true;
+  return false;
+}
+
+async function readPendingNotes(channelId: string): Promise<{ block: string; ids: string[] }> {
+  try {
+    const notes = await noteStore.peek(channelId);
+    return { block: formatNotesForPrompt(notes, wrapUntrusted), ids: notes.map((n) => n.id) };
+  } catch (err) {
+    console.error(`[Discord][tell] failed to read notes for ${channelId}: ${err instanceof Error ? err.message : err}`);
+    return { block: "", ids: [] };
+  }
+}
+
+async function ackPendingNotes(channelId: string, ids: string[]): Promise<void> {
+  await noteStore.ack(channelId, ids).catch((err) => {
+    console.error(`[Discord][tell] failed to clear notes for ${channelId}: ${err instanceof Error ? err.message : err}`);
+  });
+}
+
+async function dispatchTells(token: string, fromId: string, tells: TellDirective[], cfg: ThreadTellConfig): Promise<void> {
+  if (tells.length > MAX_TELLS_PER_REPLY) {
+    await sendMessage(token, fromId, `📣 only the first ${MAX_TELLS_PER_REPLY} tells were sent (${tells.length} in one reply).`);
+  }
+  const fromName = familyMemberName(fromId, knownThreads);
+  for (const tell of tells.slice(0, MAX_TELLS_PER_REPLY)) {
+    if (looksLikeSecret(tell.text)) {
+      console.warn(`[Discord][tell] blocked a tell from ${fromName}(${fromId}) that looks like it contains a secret`);
+      await sendMessage(token, fromId, `📣 didn't send that tell to ${tell.targets}: it looks like it contains a secret. Say what changed (e.g. "rotated in Doppler"), not the value.`);
+      continue;
+    }
+    if (tell.text.length > MAX_TELL_LENGTH) {
+      await sendMessage(token, fromId, `📣 didn't send that tell to ${tell.targets}: it's over ${MAX_TELL_LENGTH} characters. Keep tells short, or use an inbox file.`);
+      continue;
+    }
+    const { targets, errors } = resolveTellTargets(tell.targets, fromId, knownThreads);
+    for (const err of errors) await sendMessage(token, fromId, `📣 ${err}.`);
+    if (targets.length === 0) continue;
+    const refused = tellLimiter.tryAcquire(fromId, cfg);
+    if (refused) {
+      await sendMessage(token, fromId, `📣 didn't send that tell: ${refused}.`);
+      continue;
+    }
+    console.log(`[Discord][tell] ${fromName}(${fromId}) -> ${targets.map((t) => `${t.name}(${t.channelId})`).join(", ")}`);
+    const at = new Date().toISOString();
+    for (const target of targets) {
+      try {
+        const dropped = await noteStore.add(target.channelId, { fromId, fromName, text: tell.text, at }, cfg.maxPendingNotes);
+        if (dropped > 0) console.warn(`[Discord][tell] ${target.channelId} note cap reached, dropped ${dropped} oldest`);
+        await sendMessage(token, target.channelId, `📣 **from ${fromName}:** ${tell.text}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[Discord][tell] ${fromId} -> ${target.channelId} failed: ${msg}`);
+        await sendMessage(token, fromId, `📣 couldn't tell ${target.name}: ${msg}`).catch(() => {});
+      }
+    }
   }
 }
 

@@ -5,6 +5,7 @@ import { normalizeTimezoneName, resolveTimezoneOffsetMinutes } from "./timezone"
 import { parseWatchdogConfig, type WatchdogConfig } from "./watchdog";
 import { parsePlugins, type PluginEntry } from "./plugins";
 import { parseThreadAskConfig, type ThreadAskConfig } from "./thread-ask";
+import { parseThreadTellConfig, type ThreadTellConfig } from "./thread-tell";
 
 /** Re-exported under the name used in the Settings interface. */
 export type WatchdogSettings = WatchdogConfig;
@@ -136,6 +137,7 @@ export interface DiscordConfig {
   streaming?: boolean; // When true, POST a live preview while Claude is working. Default: false.
   channelAllowedUserIds?: Record<string, string[]>; // channelId -> extra user IDs allowed in that guild channel only (never DMs)
   threadAsk?: ThreadAskConfig; // thread-to-thread [ask:] hand-offs between sibling threads
+  threadTell?: ThreadTellConfig; // [tell:] notes broadcast within a parent channel and its threads
 }
 
 export interface SlackConfig {
@@ -401,6 +403,7 @@ function parseSettings(
           )
         : undefined,
       threadAsk: parseThreadAskConfig(raw.discord?.threadAsk),
+      threadTell: parseThreadTellConfig(raw.discord?.threadTell),
     },
     slack: {
       botToken: process.env.SLACK_BOT_TOKEN?.trim() || (typeof raw.slack?.botToken === "string" ? raw.slack.botToken.trim() : ""),
