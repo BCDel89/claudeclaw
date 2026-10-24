@@ -1,4 +1,4 @@
-import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, compactCurrentThreadSession, agentDirKey } from "../runner";
+import { ensureProjectClaudeMd, run, runUserMessage, runSiteSession, compactCurrentSession, compactCurrentThreadSession, agentDirKey } from "../runner";
 import { wrapUntrusted } from "../prompt-safety";
 import {
   AskLimiter,
@@ -23,6 +23,18 @@ import {
   type ThreadTellConfig,
 } from "../thread-tell";
 import { isAllowed, isDiscordAuthorized } from "../allowlist";
+import {
+  SiteLimiter,
+  buildSitePrompt,
+  extractSiteActions,
+  matchSiteWebhook,
+  siteImageExtension,
+  siteSessionDir,
+  SITE_IMAGE_MAX_BYTES,
+  type SiteAction,
+  type SiteEmbedLike,
+  type SiteWebhookConfig,
+} from "../site-webhook";
 import { extractErrorDetail } from "../messaging";
 import { loadPendingResume } from "../pending-resume";
 import { getSettings, loadSettings, DEFAULT_IMAGE_OUTPUT_ROOT } from "../config";
@@ -102,6 +114,8 @@ interface DiscordMessage {
   message_snapshots?: [{ message: DiscordMessageSnapshot }];
   flags?: number;
   type: number;
+  webhook_id?: string;
+  embeds?: SiteEmbedLike[];
 }
 
 const enum DiscordMessageType {
@@ -1061,6 +1075,14 @@ const pendingForwards = new Map<string, { snapshot: DiscordMessageSnapshot; time
 async function handleMessageCreate(token: string, message: DiscordMessage, skipCoalesce = false): Promise<void> {
   const config = getSettings().discord;
 
+  // Configured site webhooks bypass the bot filter, but only into their own locked-down
+  // session (never the channel's), and never through the normal command/skill/thread paths.
+  const site = matchSiteWebhook(message, config.siteWebhooks);
+  if (site) {
+    if (message.type === DiscordMessageType.Default) enqueueSiteTurn(token, message, site);
+    return;
+  }
+
   // Ignore bot messages
   if (message.author.bot) return;
 
@@ -1620,6 +1642,142 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
       await streamCb.finalize();
     }
     clearInterval(typingInterval);
+  }
+}
+
+// --- Site webhooks (untrusted, locked-down sessions; see site-webhook.ts) ---
+
+const siteLimiter = new SiteLimiter();
+const siteQueues = new Map<string, Promise<void>>();
+
+function enqueueSiteTurn(token: string, message: DiscordMessage, site: SiteWebhookConfig): void {
+  const slot = siteLimiter.tryAcquire(site);
+  if (!slot.ok) {
+    console.warn(`[Discord][site] ${site.label}: dropped message ${message.id} (${slot.reason} limit)`);
+    sendReaction(token, message.channel_id, message.id, "🚫").catch(() => {});
+    postSiteReply(site, { discordMessageId: message.id, error: `rate_limited_${slot.reason}` }).catch(() => {});
+    return;
+  }
+  const prev = siteQueues.get(site.webhookId) ?? Promise.resolve();
+  const next = prev
+    .then(() => handleSiteTurn(token, message, site))
+    .catch((err) => console.error(`[Discord][site] ${site.label}: ${err instanceof Error ? err.message : err}`))
+    .finally(() => siteLimiter.release(site));
+  siteQueues.set(site.webhookId, next);
+}
+
+interface SiteState {
+  sessionId: string;
+  turns: number;
+}
+
+// Kept beside (not inside) the session dir so the locked session's Read tool can't see it.
+function siteStatePath(site: SiteWebhookConfig): string {
+  return `${siteSessionDir(process.cwd(), site.webhookId)}.json`;
+}
+
+async function loadSiteState(site: SiteWebhookConfig): Promise<SiteState | null> {
+  try {
+    const s = JSON.parse(await readFile(siteStatePath(site), "utf8")) as SiteState;
+    return typeof s.sessionId === "string" && typeof s.turns === "number" ? s : null;
+  } catch {
+    return null;
+  }
+}
+
+async function postSiteReply(
+  site: SiteWebhookConfig,
+  body: { discordMessageId: string; reply?: string; actions?: SiteAction[]; costUsd?: number; error?: string },
+): Promise<{ applied: string[] }> {
+  const res = await fetch(site.replyUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${site.replyToken}` },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) throw new Error(`reply endpoint returned ${res.status}`);
+  const json = (await res.json().catch(() => ({}))) as { applied?: unknown };
+  const applied = Array.isArray(json.applied) ? json.applied.filter((a): a is string => typeof a === "string").slice(0, 10) : [];
+  return { applied };
+}
+
+async function downloadSiteImage(message: DiscordMessage, dir: string): Promise<string | null> {
+  for (const a of message.attachments) {
+    const ext = siteImageExtension(a.url, a.content_type, a.size);
+    if (!ext) continue;
+    const res = await fetch(a.url, { signal: AbortSignal.timeout(30_000) });
+    if (!res.ok) throw new Error(`image download failed: ${res.status}`);
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    if (bytes.length > SITE_IMAGE_MAX_BYTES) throw new Error("image too large");
+    const name = `${message.id}${ext}`;
+    await Bun.write(join(dir, name), bytes);
+    return name;
+  }
+  return null;
+}
+
+async function sendSiteDiscordReply(token: string, channelId: string, replyTo: string, text: string): Promise<void> {
+  const chunks = discordMessageChunks(text);
+  for (let i = 0; i < chunks.length; i++) {
+    await discordApi(token, "POST", `/channels/${channelId}/messages`, {
+      content: chunks[i],
+      allowed_mentions: { parse: [] }, // untrusted-driven text never pings anyone
+      ...(i === 0 ? { message_reference: { message_id: replyTo, fail_if_not_exists: false } } : {}),
+    });
+  }
+}
+
+async function handleSiteTurn(token: string, message: DiscordMessage, site: SiteWebhookConfig): Promise<void> {
+  const channelId = message.channel_id;
+  const dir = siteSessionDir(process.cwd(), site.webhookId);
+  await mkdir(dir, { recursive: true });
+  console.log(`[${new Date().toLocaleTimeString()}] Discord site ${site.label}: "${message.content.slice(0, 60)}"`);
+
+  const typingInterval = setInterval(() => sendTyping(token, channelId), 8000);
+  let imageName: string | null = null;
+  try {
+    await sendTyping(token, channelId);
+    imageName = await downloadSiteImage(message, dir).catch((err) => {
+      console.error(`[Discord][site] ${site.label}: ${err instanceof Error ? err.message : err}`);
+      return null;
+    });
+    const prompt = buildSitePrompt(site, message.content.replace(/\0/g, ""), message.embeds, imageName ? `./${imageName}` : null);
+
+    const state = await loadSiteState(site);
+    const resume = state && state.turns < site.maxTurns ? state.sessionId : undefined;
+    let result = await runSiteSession(site, prompt, dir, resume);
+    if (result.exitCode !== 0 && result.exitCode !== 124 && resume) {
+      // Stale or broken resumed session: one fresh attempt.
+      result = await runSiteSession(site, prompt, dir);
+    }
+
+    if (result.exitCode !== 0 || !result.stdout.trim()) {
+      const detail = result.exitCode === 124 ? "timed out" : `exit ${result.exitCode}`;
+      console.error(`[Discord][site] ${site.label}: turn failed (${detail}): ${result.stderr.slice(0, 300)}`);
+      await postSiteReply(site, { discordMessageId: message.id, error: "failed" }).catch(() => {});
+      await sendSiteDiscordReply(token, channelId, message.id, `Couldn't answer that ${site.label} message (${detail}).`);
+      return;
+    }
+
+    if (result.sessionId) {
+      const turns = resume && result.sessionId === resume ? (state?.turns ?? 0) + 1 : 1;
+      await Bun.write(siteStatePath(site), JSON.stringify({ sessionId: result.sessionId, turns }));
+    }
+
+    const { cleanedText, actions } = extractSiteActions(result.stdout);
+    const reply = cleanedText || "(no reply)";
+    let footer = "";
+    try {
+      const { applied } = await postSiteReply(site, { discordMessageId: message.id, reply, actions, costUsd: result.costUsd });
+      if (applied.length > 0) footer = "\n" + applied.map((a) => `-# ✓ ${a}`).join("\n");
+    } catch (err) {
+      console.error(`[Discord][site] ${site.label}: write-back failed: ${err instanceof Error ? err.message : err}`);
+      footer = `\n-# (couldn't write this back to the ${site.label})`;
+    }
+    await sendSiteDiscordReply(token, channelId, message.id, reply + footer);
+  } finally {
+    clearInterval(typingInterval);
+    if (imageName) await Bun.file(join(dir, imageName)).delete().catch(() => {});
   }
 }
 

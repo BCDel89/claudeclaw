@@ -26,6 +26,7 @@ import {
 } from "./sessionManager";
 import { getSettings, DEFAULT_SESSION_TIMEOUT_MS, type ModelConfig, type SecurityConfig } from "./config";
 import { buildClockPromptPrefix } from "./timezone";
+import { buildSiteArgs, type SiteWebhookConfig } from "./site-webhook";
 import { selectModel } from "./model-router";
 import { recordResult, abortReason, clearSession, startSession } from "./watchdog";
 import { getPluginManager, type EventContext } from "./plugins";
@@ -1797,6 +1798,66 @@ export async function runFork(prompt: string): Promise<RunResult> {
   }
 
   return { stdout, stderr: rawStderr, exitCode };
+}
+
+export interface SiteRunResult extends RunResult {
+  sessionId?: string;
+  costUsd?: number;
+}
+
+/**
+ * Run one locked-down site-webhook turn (see site-webhook.ts). Like runFork, this sits
+ * outside the main queue and never touches the main or channel sessions; the caller
+ * serializes turns per webhook and owns the session ID it passes in.
+ */
+export async function runSiteSession(
+  cfg: SiteWebhookConfig,
+  prompt: string,
+  cwd: string,
+  resumeSessionId?: string,
+): Promise<SiteRunResult> {
+  const { api } = getSettings();
+  const args = buildSiteArgs(CLAUDE_EXECUTABLE, cfg, prompt, resumeSessionId);
+  const proc = Bun.spawn(args, {
+    stdout: "pipe",
+    stderr: "pipe",
+    cwd,
+    env: buildChildEnv(cleanSpawnEnv(), cfg.model, api),
+  });
+
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      try { proc.kill(); } catch {}
+      reject(new Error(`Site turn timed out after ${cfg.timeoutSeconds}s`));
+    }, cfg.timeoutSeconds * 1000);
+  });
+
+  let rawStdout: string;
+  let rawStderr: string;
+  try {
+    [rawStdout, rawStderr] = await Promise.race([
+      Promise.all([
+        collectStream(proc.stdout as ReadableStream<Uint8Array>, MAX_OUTPUT_BYTES),
+        collectStream(proc.stderr as ReadableStream<Uint8Array>, MAX_OUTPUT_BYTES),
+      ]),
+      timeoutPromise,
+    ]) as [string, string];
+    if (timeoutId) clearTimeout(timeoutId);
+    await proc.exited;
+  } catch (err) {
+    if (timeoutId) clearTimeout(timeoutId);
+    return { stdout: "", stderr: String(err), exitCode: 124 };
+  }
+
+  let exitCode = proc.exitCode ?? 1;
+  try {
+    const json = JSON.parse(rawStdout) as { result?: string; session_id?: string; total_cost_usd?: number; is_error?: boolean };
+    if (json.is_error) exitCode = exitCode || 1;
+    return { stdout: json.result ?? "", stderr: rawStderr, exitCode, sessionId: json.session_id, costUsd: json.total_cost_usd };
+  } catch {
+    return { stdout: "", stderr: rawStderr || rawStdout.slice(0, 2000), exitCode: exitCode || 1 };
+  }
 }
 
 /**

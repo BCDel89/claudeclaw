@@ -6,6 +6,7 @@ import { parseWatchdogConfig, type WatchdogConfig } from "./watchdog";
 import { parsePlugins, type PluginEntry } from "./plugins";
 import { parseThreadAskConfig, type ThreadAskConfig } from "./thread-ask";
 import { parseThreadTellConfig, type ThreadTellConfig } from "./thread-tell";
+import { parseSiteWebhooks, type SiteWebhookConfig } from "./site-webhook";
 
 /** Re-exported under the name used in the Settings interface. */
 export type WatchdogSettings = WatchdogConfig;
@@ -138,6 +139,7 @@ export interface DiscordConfig {
   channelAllowedUserIds?: Record<string, string[]>; // channelId -> extra user IDs allowed in that guild channel only (never DMs)
   threadAsk?: ThreadAskConfig; // thread-to-thread [ask:] hand-offs between sibling threads
   threadTell?: ThreadTellConfig; // [tell:] notes broadcast within a parent channel and its threads
+  siteWebhooks?: SiteWebhookConfig[]; // webhooks allowed to reach a locked-down, untrusted session in one channel
 }
 
 export interface SlackConfig {
@@ -404,6 +406,7 @@ function parseSettings(
         : undefined,
       threadAsk: parseThreadAskConfig(raw.discord?.threadAsk),
       threadTell: parseThreadTellConfig(raw.discord?.threadTell),
+      siteWebhooks: parseSiteWebhooks(raw.discord?.siteWebhooks),
     },
     slack: {
       botToken: process.env.SLACK_BOT_TOKEN?.trim() || (typeof raw.slack?.botToken === "string" ? raw.slack.botToken.trim() : ""),
