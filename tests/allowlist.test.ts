@@ -35,3 +35,14 @@ test("unlisted user is denied everywhere", () => {
 test("missing channelAllowedUserIds config does not throw", () => {
   expect(isDiscordAuthorized("u1", true, "chan1", [], undefined)).toBe(false);
 });
+test("thread without its own entry inherits the parent channel's entry", () => {
+  expect(isDiscordAuthorized("u2", true, "thread1", [], { parent1: ["u2"] }, "parent1")).toBe(true);
+  expect(isDiscordAuthorized("u3", true, "thread1", [], { parent1: ["u2"] }, "parent1")).toBe(false);
+});
+test("a thread's own entry overrides its parent's", () => {
+  expect(isDiscordAuthorized("u2", true, "thread1", [], { parent1: ["u2"], thread1: ["u4"] }, "parent1")).toBe(false);
+  expect(isDiscordAuthorized("u4", true, "thread1", [], { parent1: ["u2"], thread1: ["u4"] }, "parent1")).toBe(true);
+});
+test("parent inheritance never applies to DMs", () => {
+  expect(isDiscordAuthorized("u2", false, "thread1", [], { parent1: ["u2"] }, "parent1")).toBe(false);
+});

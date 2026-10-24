@@ -162,6 +162,8 @@ let readyGuildIds: Set<string> | null = null;
 
 // Track known thread channel IDs and their parent channel IDs for multi-session support
 const knownThreads = new Map<string, { parentId: string; agentName?: string }>();
+// Guild channels already looked up and found not to be threads (see thread recovery below).
+const nonThreadChannels = new Set<string>();
 
 function isDiscordThreadType(type: number | undefined): boolean {
   return type === 10 || type === 11 || type === 12;
@@ -1072,19 +1074,20 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
   const isGuild = !!message.guild_id;
   const content = message.content.replace(/\0/g, "");
 
-  // Recover lost thread from sessions.json (fallback for knownThreads volatility)
-  if (isGuild && !knownThreads.has(channelId)) {
-    const persisted = await peekThreadSession(channelId);
-    if (persisted) {
-      try {
-        const ch = await discordApi<{ parent_id?: string; name?: string; type?: number }>(config.token, "GET", `/channels/${channelId}`);
-        if (isDiscordThreadType(ch.type) && ch.parent_id) {
-          upsertThread(channelId, ch.parent_id, ch.name);
-          debugLog(`Thread recovered from sessions.json: ${channelId} (parent: ${ch.parent_id} name: ${ch.name ?? "unknown"})`);
-        }
-      } catch (err) {
-        debugLog(`Thread recovery failed for ${channelId}: ${err}`);
+  // Recover threads missing from knownThreads (restart, unarchive, or created while the gateway
+  // was down) so they inherit their parent's listen and allowlist settings. Each unknown
+  // channel is looked up once; channels that turn out not to be threads are remembered.
+  if (isGuild && !knownThreads.has(channelId) && !nonThreadChannels.has(channelId)) {
+    try {
+      const ch = await discordApi<{ parent_id?: string; name?: string; type?: number }>(config.token, "GET", `/channels/${channelId}`);
+      if (isDiscordThreadType(ch.type) && ch.parent_id) {
+        upsertThread(channelId, ch.parent_id, ch.name);
+        console.log(`[Discord] Thread discovered on message: ${channelId} name="${ch.name ?? "unknown"}" parent=${ch.parent_id}`);
+      } else {
+        nonThreadChannels.add(channelId);
       }
+    } catch (err) {
+      debugLog(`Thread lookup failed for ${channelId}: ${err}`);
     }
   }
 
@@ -1101,7 +1104,8 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
 
   // Authorization check — global allowlist works everywhere; channel-scoped allowlist only
   // grants access to guild messages in that specific channel, never DMs.
-  if (!isDiscordAuthorized(userId, isGuild, channelId, config.allowedUserIds, config.channelAllowedUserIds)) {
+  const parentChannelId = knownThreads.get(channelId)?.parentId;
+  if (!isDiscordAuthorized(userId, isGuild, channelId, config.allowedUserIds, config.channelAllowedUserIds, parentChannelId)) {
     if (isDM) {
       await sendMessage(config.token, channelId, "Unauthorized.");
     } else {
