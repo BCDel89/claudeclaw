@@ -4,6 +4,7 @@ import { existsSync } from "fs";
 import { normalizeTimezoneName, resolveTimezoneOffsetMinutes } from "./timezone";
 import { parseWatchdogConfig, type WatchdogConfig } from "./watchdog";
 import { parsePlugins, type PluginEntry } from "./plugins";
+import { parseSiteWebhooks, type SiteWebhookConfig } from "./site-webhook";
 
 /** Re-exported under the name used in the Settings interface. */
 export type WatchdogSettings = WatchdogConfig;
@@ -130,6 +131,7 @@ export interface DiscordConfig {
   listenGuilds: string[]; // Guild IDs where bot responds to all messages in any channel/thread
   channelNames?: Record<string, string>; // channelId -> friendly name for system prompt context
   imageOutputRoots: string[]; // Absolute path prefixes from which image uploads are permitted
+  siteWebhooks?: SiteWebhookConfig[]; // webhooks allowed to reach a locked-down, untrusted session in one channel
 }
 
 export interface SlackConfig {
@@ -363,6 +365,7 @@ function parseSettings(
       imageOutputRoots: Array.isArray(raw.discord?.imageOutputRoots)
         ? raw.discord.imageOutputRoots.filter((r: unknown) => typeof r === "string" && isAbsolute(r))
         : [],
+      siteWebhooks: parseSiteWebhooks(raw.discord?.siteWebhooks),
     },
     slack: {
       botToken: process.env.SLACK_BOT_TOKEN?.trim() || (typeof raw.slack?.botToken === "string" ? raw.slack.botToken.trim() : ""),
